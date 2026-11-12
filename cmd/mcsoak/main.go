@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ilyasbit/mcsoak"
+	"github.com/ilyasbit/mcsoak/reflector"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -28,7 +29,22 @@ func main() {
 	certFlag := flag.String("cert", getEnv("SOAK_CERT", ""), "Path to TLS certificate file")
 	keyFlag := flag.String("key", getEnv("SOAK_KEY", ""), "Path to TLS private key file")
 	tcpFpFlag := flag.String("tcp-fp", getEnv("TCP_FP_URL", "http://127.0.0.1:7778"), "TCP fingerprint daemon URL")
+	reflectorFlag := flag.Bool("reflector", getEnv("SOAK_REFLECTOR", "") == "true" || getEnv("SOAK_REFLECTOR", "") == "1", "Enable eBPF pulse reflector")
+	ifaceFlag := flag.String("iface", getEnv("SOAK_IFACE", ""), "Network interface for eBPF reflector (defaults to eth0)")
 	flag.Parse()
+
+	if *reflectorFlag || *ifaceFlag != "" {
+		refl, err := reflector.Start(*ifaceFlag)
+		if err != nil {
+			log.Printf("Warning: Failed to start eBPF reflector: %v", err)
+		} else {
+			defer func() {
+				if err := refl.Close(); err != nil {
+					log.Printf("Warning: Failed to close eBPF reflector: %v", err)
+				}
+			}()
+		}
+	}
 
 	tlsConfig, err := mcsoak.LoadOrGenerateTLS(*certFlag, *keyFlag)
 	if err != nil {
