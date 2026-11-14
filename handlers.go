@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,12 +38,15 @@ type EchoResponse struct {
 	TLS            *TLSInfo            `json:"tls,omitempty"`
 	Headers        map[string][]string `json:"headers"`
 	TCPFingerprint any                 `json:"tcp_fingerprint,omitempty"`
+	ASN            uint32              `json:"asn,omitempty"`
+	ISP            string              `json:"isp,omitempty"`
 }
 
 type ServerConfig struct {
 	FPStore        *tcpfp.Store
 	DNSStore       *dnsleak.Store
 	ReflectorStats *reflector.StatsTracker
+	ASNLookup      *ASNLookup
 	Token          string
 }
 
@@ -50,6 +54,7 @@ type Server struct {
 	fpStore        *tcpfp.Store
 	dnsStore       *dnsleak.Store
 	reflectorStats *reflector.StatsTracker
+	asnLookup      *ASNLookup
 	token          string
 	upgrader       websocket.Upgrader
 	burstData      []byte
@@ -79,6 +84,7 @@ func NewServer(cfg ServerConfig) *Server {
 		fpStore:        cfg.FPStore,
 		dnsStore:       cfg.DNSStore,
 		reflectorStats: cfg.ReflectorStats,
+		asnLookup:      cfg.ASNLookup,
 		token:          cfg.Token,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -93,6 +99,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/echo", s.authMiddleware(http.HandlerFunc(s.handleEcho)))
+	mux.Handle("/asn", s.authMiddleware(http.HandlerFunc(s.handleASN)))
 	mux.Handle("/fp", s.authMiddleware(http.HandlerFunc(s.handleFingerprint)))
 	mux.Handle("/ws", s.authMiddleware(http.HandlerFunc(s.handleWebSocket)))
 	mux.Handle("/page", s.authMiddleware(http.HandlerFunc(s.handlePage)))
@@ -188,9 +195,43 @@ func (s *Server) handleEcho(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.asnLookup != nil {
+		if addr, err := netip.ParseAddr(clientIP); err == nil {
+			if info, ok := s.asnLookup.Lookup(addr); ok {
+				echo.ASN = info.ASN
+				echo.ISP = info.ISP
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(echo)
+}
+
+func (s *Server) handleASN(w http.ResponseWriter, r *http.Request) {
+	ipStr := extractClientIP(r)
+	addr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid ip address")
+		return
+	}
+
+	resp := struct {
+		IP  string `json:"ip"`
+		ASN uint32 `json:"asn"`
+		ISP string `json:"isp"`
+	}{
+		IP: addr.String(),
+	}
+	if info, ok := s.asnLookup.Lookup(addr); ok {
+		resp.ASN = info.ASN
+		resp.ISP = info.ISP
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleFingerprint(w http.ResponseWriter, r *http.Request) {

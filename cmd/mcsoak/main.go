@@ -61,6 +61,7 @@ func main() {
 	dnsleakFlag := flag.Bool("dnsleak", getEnvBool("SOAK_DNSLEAK", false), "Enable authoritative DNS leak oracle")
 	dnsListenFlag := flag.String("dns-listen", getEnv("SOAK_DNS_LISTEN", ":53"), "DNS leak oracle listen address")
 	dnsDomainFlag := flag.String("dns-domain", getEnv("SOAK_DNS_DOMAIN", "sight.muterconn.com"), "Base domain for DNS leak oracle")
+	asnDBFlag := flag.String("asn-db", getEnv("SOAK_ASN_DB", ""), "Path to MaxMind .mmdb ASN database")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -117,10 +118,25 @@ func main() {
 		log.Fatalf("Failed to load or generate TLS config: %v", err)
 	}
 
+	var asnLookup *mcsoak.ASNLookup
+	if *asnDBFlag != "" {
+		var err error
+		asnLookup, err = mcsoak.OpenASNLookup(*asnDBFlag)
+		if err != nil {
+			log.Fatalf("Failed to open ASN database %s: %v", *asnDBFlag, err)
+		}
+		defer func() {
+			if err := asnLookup.Close(); err != nil {
+				log.Printf("Warning: Failed to close ASN database: %v", err)
+			}
+		}()
+	}
+
 	srv := mcsoak.NewServer(mcsoak.ServerConfig{
 		FPStore:        fpStore,
 		DNSStore:       dnsStore,
 		ReflectorStats: statsTracker,
+		ASNLookup:      asnLookup,
 		Token:          *tokenFlag,
 	})
 	handler := srv.Routes()
