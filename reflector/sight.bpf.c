@@ -13,6 +13,51 @@
 
 #define TARGET_PORT 7777
 
+struct pulse_event {
+    __u64 timestamp_ns;
+    __u8  src_ip[16];
+    __u16 src_port;
+    __u8  proto;
+    __u8  ip_version;
+    __u8  flags;
+    __u8  pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} pulse_events SEC(".maps");
+
+static __always_inline void emit_pulse_event_v4(__u32 src_ip, __u16 src_port_be, __u8 proto, __u8 flags) {
+    struct pulse_event *ev = bpf_ringbuf_reserve(&pulse_events, sizeof(*ev), 0);
+    if (!ev) {
+        return;
+    }
+    __builtin_memset(ev, 0, sizeof(*ev));
+    ev->timestamp_ns = bpf_ktime_get_ns();
+    __builtin_memcpy(ev->src_ip, &src_ip, 4);
+    ev->src_port = bpf_ntohs(src_port_be);
+    ev->proto = proto;
+    ev->ip_version = 4;
+    ev->flags = flags;
+    bpf_ringbuf_submit(ev, 0);
+}
+
+static __always_inline void emit_pulse_event_v6(const struct in6_addr *src_ip, __u16 src_port_be, __u8 proto, __u8 flags) {
+    struct pulse_event *ev = bpf_ringbuf_reserve(&pulse_events, sizeof(*ev), 0);
+    if (!ev) {
+        return;
+    }
+    __builtin_memset(ev, 0, sizeof(*ev));
+    ev->timestamp_ns = bpf_ktime_get_ns();
+    __builtin_memcpy(ev->src_ip, src_ip, 16);
+    ev->src_port = bpf_ntohs(src_port_be);
+    ev->proto = proto;
+    ev->ip_version = 6;
+    ev->flags = flags;
+    bpf_ringbuf_submit(ev, 0);
+}
+
 static __always_inline __u16 csum_fold_helper(__u32 csum) {
     csum = (csum & 0xffff) + (csum >> 16);
     csum = (csum & 0xffff) + (csum >> 16);
@@ -128,6 +173,8 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
 
                 // Write client's public IPv4 address
                 *payload = client_ip;
+
+                emit_pulse_event_v4(client_ip, udph->source, IPPROTO_UDP, 0);
 
                 // Swap MACs
                 __u8 tmp_mac[ETH_ALEN];
@@ -352,6 +399,8 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
             if (tcph->dest == bpf_htons(TARGET_PORT)) {
                 if (tcph->syn) {
                     // TCP Handshake Spoofing over IPv6 (SYN -> SYN-ACK)
+                    emit_pulse_event_v6(&ip6h->saddr, tcph->source, IPPROTO_TCP, 0x02);
+
                     // Swap MACs
                     __u8 tmp_mac[ETH_ALEN];
                     __builtin_memcpy(tmp_mac, eth->h_source, ETH_ALEN);
