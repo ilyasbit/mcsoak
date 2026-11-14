@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect

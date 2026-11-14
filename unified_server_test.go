@@ -126,7 +126,7 @@ func TestTokenAuthMiddleware(t *testing.T) {
 		t.Fatalf("expected /health 200 without token, got %d", resp.StatusCode)
 	}
 
-	protected := []string{"/echo", "/fp", "/dns", "/reflector/stats"}
+	protected := []string{"/echo", "/asn", "/fp", "/dns", "/reflector/stats"}
 	for _, ep := range protected {
 		r, err := http.Get(ts.URL + ep)
 		if err != nil {

@@ -7,12 +7,9 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
-	"regexp"
-	"strconv"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -21,8 +18,6 @@ import (
 	"github.com/ilyasbit/mcsoak/reflector"
 	"github.com/ilyasbit/mcsoak/tcpfp"
 )
-
-var assetRegex = regexp.MustCompile(`^/assets/(chunk|style|img)_(\d+)\.(js|css|svg)$`)
 
 type TLSInfo struct {
 	Version            string `json:"version,omitempty"`
@@ -37,12 +32,15 @@ type EchoResponse struct {
 	TLS            *TLSInfo            `json:"tls,omitempty"`
 	Headers        map[string][]string `json:"headers"`
 	TCPFingerprint any                 `json:"tcp_fingerprint,omitempty"`
+	ASN            uint32              `json:"asn,omitempty"`
+	ISP            string              `json:"isp,omitempty"`
 }
 
 type ServerConfig struct {
 	FPStore        *tcpfp.Store
 	DNSStore       *dnsleak.Store
 	ReflectorStats *reflector.StatsTracker
+	ASNLookup      *ASNLookup
 	Token          string
 }
 
@@ -50,6 +48,7 @@ type Server struct {
 	fpStore        *tcpfp.Store
 	dnsStore       *dnsleak.Store
 	reflectorStats *reflector.StatsTracker
+	asnLookup      *ASNLookup
 	token          string
 	upgrader       websocket.Upgrader
 	burstData      []byte
@@ -79,6 +78,7 @@ func NewServer(cfg ServerConfig) *Server {
 		fpStore:        cfg.FPStore,
 		dnsStore:       cfg.DNSStore,
 		reflectorStats: cfg.ReflectorStats,
+		asnLookup:      cfg.ASNLookup,
 		token:          cfg.Token,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -93,6 +93,7 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/echo", s.authMiddleware(http.HandlerFunc(s.handleEcho)))
+	mux.Handle("/asn", s.authMiddleware(http.HandlerFunc(s.handleASN)))
 	mux.Handle("/fp", s.authMiddleware(http.HandlerFunc(s.handleFingerprint)))
 	mux.Handle("/ws", s.authMiddleware(http.HandlerFunc(s.handleWebSocket)))
 	mux.Handle("/page", s.authMiddleware(http.HandlerFunc(s.handlePage)))
@@ -188,9 +189,43 @@ func (s *Server) handleEcho(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.asnLookup != nil {
+		if addr, err := netip.ParseAddr(clientIP); err == nil {
+			if info, ok := s.asnLookup.Lookup(addr); ok {
+				echo.ASN = info.ASN
+				echo.ISP = info.ISP
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(echo)
+}
+
+func (s *Server) handleASN(w http.ResponseWriter, r *http.Request) {
+	ipStr := extractClientIP(r)
+	addr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid ip address")
+		return
+	}
+
+	resp := struct {
+		IP  string `json:"ip"`
+		ASN uint32 `json:"asn"`
+		ISP string `json:"isp"`
+	}{
+		IP: addr.String(),
+	}
+	if info, ok := s.asnLookup.Lookup(addr); ok {
+		resp.ASN = info.ASN
+		resp.ISP = info.ISP
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleFingerprint(w http.ResponseWriter, r *http.Request) {
@@ -269,113 +304,3 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	var b strings.Builder
-	b.WriteString("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>MCSOak Page</title>\n")
-
-	// 15 CSS sub-resources
-	for i := 1; i <= 15; i++ {
-		b.WriteString(fmt.Sprintf("<link rel=\"stylesheet\" href=\"/assets/style_%d.css\">\n", i))
-	}
-
-	b.WriteString("</head>\n<body>\n<h1>MCSOak Test Page</h1>\n<div id=\"svg-container\">\n")
-
-	// 10 SVG sub-resources
-	for i := 1; i <= 10; i++ {
-		b.WriteString(fmt.Sprintf("<img src=\"/assets/img_%d.svg\" alt=\"img_%d\">\n", i, i))
-	}
-	b.WriteString("</div>\n<script>\n")
-	b.WriteString(`
-const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const ws = new WebSocket(proto + '//' + location.host + '/ws');
-ws.onopen = () => console.log('ws open');
-ws.onmessage = (e) => console.log('ws msg:', e.data);
-`)
-	b.WriteString("</script>\n")
-
-	// 25 JS sub-resources
-	for i := 1; i <= 25; i++ {
-		b.WriteString(fmt.Sprintf("<script src=\"/assets/chunk_%d.js\"></script>\n", i))
-	}
-
-	b.WriteString("</body>\n</html>\n")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(b.String()))
-}
-
-func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
-	matches := assetRegex.FindStringSubmatch(r.URL.Path)
-	if len(matches) != 4 {
-		http.NotFound(w, r)
-		return
-	}
-
-	kind := matches[1]
-	idxStr := matches[2]
-	ext := matches[3]
-	idx, _ := strconv.Atoi(idxStr)
-
-	switch ext {
-	case "js":
-		w.Header().Set("Content-Type", "application/javascript")
-	case "css":
-		w.Header().Set("Content-Type", "text/css")
-	case "svg":
-		w.Header().Set("Content-Type", "image/svg+xml")
-	default:
-		w.Header().Set("Content-Type", "application/octet-stream")
-	}
-
-	payload := make([]byte, 2048)
-	rnd := rand.New(rand.NewSource(int64(idx*1000 + len(kind))))
-	_, _ = rnd.Read(payload)
-
-	var content []byte
-	switch ext {
-	case "js":
-		prefix := fmt.Sprintf("/* chunk %d */\nwindow.asset_%s_%d = \"", idx, kind, idx)
-		suffix := "\";\n"
-		bodyLen := 2048 - len(prefix) - len(suffix)
-		if bodyLen > 0 {
-			hexPart := hex.EncodeToString(payload)[:bodyLen]
-			content = []byte(prefix + hexPart + suffix)
-		} else {
-			content = payload
-		}
-	case "css":
-		prefix := fmt.Sprintf("/* style %d */\n.asset_%s_%d { content: \"", idx, kind, idx)
-		suffix := "\"; }\n"
-		bodyLen := 2048 - len(prefix) - len(suffix)
-		if bodyLen > 0 {
-			hexPart := hex.EncodeToString(payload)[:bodyLen]
-			content = []byte(prefix + hexPart + suffix)
-		} else {
-			content = payload
-		}
-	case "svg":
-		prefix := fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" data-idx=\"%d\"><desc>", idx)
-		suffix := "</desc></svg>"
-		bodyLen := 2048 - len(prefix) - len(suffix)
-		if bodyLen > 0 {
-			hexPart := hex.EncodeToString(payload)[:bodyLen]
-			content = []byte(prefix + hexPart + suffix)
-		} else {
-			content = payload
-		}
-	default:
-		content = payload
-	}
-
-	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(content)
-}
-
-func (s *Server) handleBurst(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Encoding", "gzip")
-	w.Header().Set("Content-Length", strconv.Itoa(len(s.burstData)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(s.burstData)
-}
