@@ -3,12 +3,11 @@ package mcsoak
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,6 +17,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/ilyasbit/mcsoak/dnsleak"
+	"github.com/ilyasbit/mcsoak/reflector"
+	"github.com/ilyasbit/mcsoak/tcpfp"
 )
 
 var assetRegex = regexp.MustCompile(`^/assets/(chunk|style|img)_(\d+)\.(js|css|svg)$`)
@@ -37,14 +39,23 @@ type EchoResponse struct {
 	TCPFingerprint any                 `json:"tcp_fingerprint,omitempty"`
 }
 
-type Server struct {
-	tcpFpURL   string
-	httpClient *http.Client
-	upgrader   websocket.Upgrader
-	burstData  []byte
+type ServerConfig struct {
+	FPStore        *tcpfp.Store
+	DNSStore       *dnsleak.Store
+	ReflectorStats *reflector.StatsTracker
+	Token          string
 }
 
-func NewServer(tcpFpURL string) *Server {
+type Server struct {
+	fpStore        *tcpfp.Store
+	dnsStore       *dnsleak.Store
+	reflectorStats *reflector.StatsTracker
+	token          string
+	upgrader       websocket.Upgrader
+	burstData      []byte
+}
+
+func NewServer(cfg ServerConfig) *Server {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	burstObj := map[string]any{
@@ -65,10 +76,10 @@ func NewServer(tcpFpURL string) *Server {
 	_ = gw.Close()
 
 	return &Server{
-		tcpFpURL: strings.TrimRight(tcpFpURL, "/"),
-		httpClient: &http.Client{
-			Timeout: 500 * time.Millisecond,
-		},
+		fpStore:        cfg.FPStore,
+		dnsStore:       cfg.DNSStore,
+		reflectorStats: cfg.ReflectorStats,
+		token:          cfg.Token,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -81,13 +92,64 @@ func NewServer(tcpFpURL string) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/api/echo", s.handleEchoAndFingerprint)
-	mux.HandleFunc("/api/fingerprint", s.handleEchoAndFingerprint)
-	mux.HandleFunc("/ws", s.handleWebSocket)
-	mux.HandleFunc("/page", s.handlePage)
-	mux.HandleFunc("/assets/", s.handleAssets)
-	mux.HandleFunc("/burst", s.handleBurst)
+	mux.Handle("/echo", s.authMiddleware(http.HandlerFunc(s.handleEcho)))
+	mux.Handle("/fp", s.authMiddleware(http.HandlerFunc(s.handleFingerprint)))
+	mux.Handle("/ws", s.authMiddleware(http.HandlerFunc(s.handleWebSocket)))
+	mux.Handle("/page", s.authMiddleware(http.HandlerFunc(s.handlePage)))
+	mux.Handle("/assets/", s.authMiddleware(http.HandlerFunc(s.handleAssets)))
+	mux.Handle("/burst", s.authMiddleware(http.HandlerFunc(s.handleBurst)))
+	mux.Handle("/dns", s.authMiddleware(http.HandlerFunc(s.handleDNSRegister)))
+	mux.Handle("/dns/check", s.authMiddleware(http.HandlerFunc(s.handleDNSCheck)))
+	mux.Handle("/reflector/stats", s.authMiddleware(http.HandlerFunc(s.handleReflectorStats)))
 	return mux
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.token == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if s.checkToken(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	})
+}
+
+func (s *Server) checkToken(r *http.Request) bool {
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		got := strings.TrimPrefix(auth, "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+			return true
+		}
+	}
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		if subtle.ConstantTimeCompare([]byte(qToken), []byte(s.token)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func extractClientIP(r *http.Request) string {
+	if ip := strings.TrimSpace(r.URL.Query().Get("ip")); ip != "" {
+		return ip
+	}
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return clientIP
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +161,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleEchoAndFingerprint(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleEcho(w http.ResponseWriter, r *http.Request) {
 	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		clientIP = r.RemoteAddr
@@ -120,32 +182,67 @@ func (s *Server) handleEchoAndFingerprint(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if s.tcpFpURL != "" {
-		ctx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
-		defer cancel()
-
-		reqURL := fmt.Sprintf("%s/check?ip=%s", s.tcpFpURL, clientIP)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err == nil {
-			resp, err := s.httpClient.Do(req)
-			if err == nil {
-				defer resp.Body.Close()
-				body, err := io.ReadAll(resp.Body)
-				if err == nil {
-					var fp any
-					if json.Unmarshal(body, &fp) == nil {
-						echo.TCPFingerprint = fp
-					} else {
-						echo.TCPFingerprint = string(body)
-					}
-				}
-			}
+	if s.fpStore != nil {
+		if fp, ok := s.fpStore.Lookup(clientIP); ok {
+			echo.TCPFingerprint = fp
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(echo)
+}
+
+func (s *Server) handleFingerprint(w http.ResponseWriter, r *http.Request) {
+	if s.fpStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "tcpfp store not configured")
+		return
+	}
+
+	ip := extractClientIP(r)
+	fp, ok := s.fpStore.Lookup(ip)
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":     "fingerprint not found",
+			"target_ip": ip,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(fp)
+}
+
+func (s *Server) handleDNSRegister(w http.ResponseWriter, r *http.Request) {
+	if s.dnsStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "dnsleak store not configured")
+		return
+	}
+	s.dnsStore.HandleRegister(w, r)
+}
+
+func (s *Server) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
+	if s.dnsStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "dnsleak store not configured")
+		return
+	}
+	s.dnsStore.HandleCheck(w, r)
+}
+
+func (s *Server) handleReflectorStats(w http.ResponseWriter, r *http.Request) {
+	if s.reflectorStats == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "reflector stats not configured")
+		return
+	}
+	ipsParam := r.URL.Query().Get("ips")
+	includeIPs := ipsParam == "true" || ipsParam == "1"
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(s.reflectorStats.Snapshot(includeIPs))
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +328,7 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := make([]byte, 2048)
-	rnd := rand.New(rand.NewSource(int64(idx * 1000 + len(kind))))
+	rnd := rand.New(rand.NewSource(int64(idx*1000 + len(kind))))
 	_, _ = rnd.Read(payload)
 
 	var content []byte

@@ -15,18 +15,41 @@ import (
 )
 
 var DefaultHosts = []string{
-	"de1.muterconn.com",
 	"localhost",
 	"127.0.0.1",
 	"::1",
-	"2a03:4000:62:276:780d:8eff:fe39:2a1a",
+}
+
+// BuildSANHosts collects default loopback SANs, SOAK_PUBLIC_IPV4/SOAK_PUBLIC_IPV6
+// environment variables, and any caller-supplied hosts/IPs, deduplicated.
+func BuildSANHosts(hosts ...string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(h string) {
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+
+	for _, h := range DefaultHosts {
+		add(h)
+	}
+	add(os.Getenv("SOAK_PUBLIC_IPV4"))
+	add(os.Getenv("SOAK_PUBLIC_IPV6"))
+	for _, h := range hosts {
+		add(h)
+	}
+	return out
 }
 
 // GenerateSelfSignedCert generates an ECDSA P-256 certificate with 1-year validity.
 func GenerateSelfSignedCert(hosts ...string) (tls.Certificate, error) {
-	if len(hosts) == 0 {
-		hosts = DefaultHosts
-	}
+	sanHosts := BuildSANHosts(hosts...)
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -39,7 +62,7 @@ func GenerateSelfSignedCert(hosts ...string) (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("failed to generate serial number: %w", err)
 	}
 
-	notBefore := time.Now()
+	notBefore := time.Now().Add(-1 * time.Hour)
 	notAfter := notBefore.Add(365 * 24 * time.Hour)
 
 	template := x509.Certificate{
@@ -54,7 +77,7 @@ func GenerateSelfSignedCert(hosts ...string) (tls.Certificate, error) {
 		BasicConstraintsValid: true,
 	}
 
-	for _, h := range hosts {
+	for _, h := range sanHosts {
 		if ip := net.ParseIP(h); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
 		} else {
@@ -100,7 +123,7 @@ func LoadOrGenerateTLS(certPath, keyPath string, hosts ...string) (*tls.Config, 
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2", "http/1.1"},
+		NextProtos:   []string{"h3", "h2", "http/1.1"},
 		MinVersion:   tls.VersionTLS12,
 	}
 

@@ -15,10 +15,27 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/ilyasbit/mcsoak/dnsleak"
+	"github.com/ilyasbit/mcsoak/reflector"
+	"github.com/ilyasbit/mcsoak/tcpfp"
 )
 
+func newTestServer(token string) (*Server, *tcpfp.Store, *dnsleak.Store, *reflector.StatsTracker) {
+	fpStore := tcpfp.NewStore(64)
+	dnsStore := dnsleak.NewStore(64, time.Minute)
+	dnsStore.SetBaseDomain("sight.muterconn.com")
+	stats := reflector.NewStatsTracker(16)
+	srv := NewServer(ServerConfig{
+		FPStore:        fpStore,
+		DNSStore:       dnsStore,
+		ReflectorStats: stats,
+		Token:          token,
+	})
+	return srv, fpStore, dnsStore, stats
+}
+
 func TestHealth(t *testing.T) {
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -41,75 +58,8 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-func TestAPIFingerprintWithMockDaemon(t *testing.T) {
-	mock := NewMockTCPFPDaemon("Linux 5.x/6.x")
-	defer mock.Close()
-
-	srv := NewServer(mock.URL)
-	ts := httptest.NewServer(srv.Routes())
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/api/fingerprint")
-	if err != nil {
-		t.Fatalf("failed request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", resp.StatusCode)
-	}
-
-	var echo EchoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&echo); err != nil {
-		t.Fatalf("failed to decode echo response: %v", err)
-	}
-
-	if echo.TCPFingerprint == nil {
-		t.Fatalf("expected tcp_fingerprint to be populated")
-	}
-	fpMap, ok := echo.TCPFingerprint.(map[string]any)
-	if !ok {
-		t.Fatalf("expected tcp_fingerprint to be map[string]any, got %T", echo.TCPFingerprint)
-	}
-	if fpMap["os"] != "Linux 5.x/6.x" {
-		t.Errorf("expected os Linux 5.x/6.x, got %v", fpMap["os"])
-	}
-}
-
-func TestAPIFingerprintTimeoutGraceful(t *testing.T) {
-	slowMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(700 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"os":"Slow"}`))
-	}))
-	defer slowMock.Close()
-
-	srv := NewServer(slowMock.URL)
-	ts := httptest.NewServer(srv.Routes())
-	defer ts.Close()
-
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(ts.URL + "/api/fingerprint")
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", resp.StatusCode)
-	}
-
-	var echo EchoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&echo); err != nil {
-		t.Fatalf("failed to decode: %v", err)
-	}
-	if echo.TCPFingerprint != nil {
-		t.Fatalf("expected null tcp_fingerprint on timeout, got %v", echo.TCPFingerprint)
-	}
-}
-
 func TestAssets(t *testing.T) {
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -130,7 +80,7 @@ func TestAssets(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get %s failed: %v", tc.path, err)
 		}
-		defer resp.Body.Close()
+		resp.Body.Close()
 		if resp.StatusCode != tc.status {
 			t.Errorf("for %s expected status %d, got %d", tc.path, tc.status, resp.StatusCode)
 		}
@@ -144,7 +94,7 @@ func TestAssets(t *testing.T) {
 }
 
 func TestBurst(t *testing.T) {
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -187,7 +137,7 @@ func TestBurst(t *testing.T) {
 }
 
 func TestPage(t *testing.T) {
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -206,7 +156,6 @@ func TestPage(t *testing.T) {
 	}
 	bodyStr := string(body)
 
-	// Check 15 CSS, 10 SVG, 25 JS (50 sub-resources total)
 	for i := 1; i <= 15; i++ {
 		pattern := fmt.Sprintf("/assets/style_%d.css", i)
 		if !strings.Contains(bodyStr, pattern) {
@@ -231,7 +180,7 @@ func TestPage(t *testing.T) {
 }
 
 func TestWebSocketEcho(t *testing.T) {
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -243,7 +192,6 @@ func TestWebSocketEcho(t *testing.T) {
 	}
 	defer ws.Close()
 
-	// Test Text Frame Echo
 	msgText := "hello mcsoak websocket"
 	if err := ws.WriteMessage(websocket.TextMessage, []byte(msgText)); err != nil {
 		t.Fatalf("failed to write text message: %v", err)
@@ -256,7 +204,6 @@ func TestWebSocketEcho(t *testing.T) {
 		t.Errorf("expected text message '%s', got '%s' (type %d)", msgText, string(msgBytes), mt)
 	}
 
-	// Test Binary Frame Echo
 	binData := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02}
 	if err := ws.WriteMessage(websocket.BinaryMessage, binData); err != nil {
 		t.Fatalf("failed to write binary message: %v", err)
@@ -269,7 +216,6 @@ func TestWebSocketEcho(t *testing.T) {
 		t.Errorf("expected binary message %v, got %v (type %d)", binData, msgBytes, mt)
 	}
 
-	// Test Ping / Pong
 	pongReceived := make(chan string, 1)
 	ws.SetPongHandler(func(appData string) error {
 		pongReceived <- appData
@@ -278,7 +224,6 @@ func TestWebSocketEcho(t *testing.T) {
 	if err := ws.WriteControl(websocket.PingMessage, []byte("ping-payload"), time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("failed to write ping: %v", err)
 	}
-	// Wait briefly or do a dummy read to trigger pong handler
 	_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	_, _, _ = ws.ReadMessage()
 	select {
@@ -297,7 +242,7 @@ func TestTLSHandshakeAndHTTP2(t *testing.T) {
 		t.Fatalf("failed to load or generate tls: %v", err)
 	}
 
-	srv := NewServer("")
+	srv, _, _, _ := newTestServer("")
 	ts := httptest.NewUnstartedServer(srv.Routes())
 	ts.TLS = tlsConfig
 	ts.StartTLS()
@@ -312,7 +257,7 @@ func TestTLSHandshakeAndHTTP2(t *testing.T) {
 	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	client.Transport = transport
 
-	resp, err := client.Get(ts.URL + "/api/echo")
+	resp, err := client.Get(ts.URL + "/echo")
 	if err != nil {
 		t.Fatalf("failed to request TLS server: %v", err)
 	}
@@ -335,7 +280,10 @@ func TestTLSHandshakeAndHTTP2(t *testing.T) {
 }
 
 func TestConcurrentRequests_Race(t *testing.T) {
-	srv := NewServer("")
+	srv, fpStore, _, stats := newTestServer("")
+	fpStore.Record(tcpfp.Fingerprint{TargetIP: "127.0.0.1", OS: "Linux"})
+	stats.Record(reflector.PulseEvent{Proto: 6, IPVersion: 4})
+
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
 
@@ -344,7 +292,10 @@ func TestConcurrentRequests_Race(t *testing.T) {
 	endpoints := []string{
 		"/health",
 		"/burst",
-		"/api/echo",
+		"/echo",
+		"/fp?ip=127.0.0.1",
+		"/dns",
+		"/reflector/stats",
 		"/assets/chunk_1.js",
 		"/assets/style_2.css",
 	}
