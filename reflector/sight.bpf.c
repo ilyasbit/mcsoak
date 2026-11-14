@@ -361,26 +361,49 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
             if ((void *)(udph + 1) > data_end) return XDP_PASS;
 
             if (udph->dest == bpf_htons(TARGET_PORT)) {
-                // UDP Keepalive Reflector over IPv6 (Expand tail by 16 bytes)
-                if (bpf_xdp_adjust_tail(ctx, 16) != 0) {
-                    return XDP_PASS;
+                struct in6_addr client_ip = ip6h->saddr;
+                __u16 client_port_be = udph->source;
+                __u8 *payload = (void *)(udph + 1);
+                int has_magic = 0;
+
+                if ((void *)(payload + 4) <= data_end) {
+                    if (payload[0] == 'M' && payload[1] == 'C' && payload[2] == 'P' &&
+                        (payload[3] == 0 || payload[3] == 1)) {
+                        has_magic = 1;
+                    }
                 }
 
-                // Re-evaluate boundaries after tail adjustment
-                data = (void *)(long)ctx->data;
-                data_end = (void *)(long)ctx->data_end;
-                eth = data;
-                if ((void *)(eth + 1) > data_end) return XDP_DROP;
-                ip6h = (void *)(eth + 1);
-                if ((void *)(ip6h + 1) > data_end) return XDP_DROP;
-                udph = (void *)(ip6h + 1);
-                if ((void *)(udph + 1) > data_end) return XDP_DROP;
+                if (has_magic) {
+                    if ((void *)(payload + 18) <= data_end) {
+                        __builtin_memcpy(payload, &client_ip, 16);
+                        __builtin_memcpy(payload + 16, &client_port_be, 2);
+                    } else if ((void *)(payload + 16) <= data_end) {
+                        __builtin_memcpy(payload, &client_ip, 16);
+                    }
+                } else {
+                    // UDP Keepalive Reflector over IPv6 (Expand tail by 16 bytes)
+                    if (bpf_xdp_adjust_tail(ctx, 16) != 0) {
+                        return XDP_PASS;
+                    }
 
-                struct in6_addr *payload = (void *)(udph + 1);
-                if ((void *)(payload + 1) > data_end) return XDP_DROP;
+                    // Re-evaluate boundaries after tail adjustment
+                    data = (void *)(long)ctx->data;
+                    data_end = (void *)(long)ctx->data_end;
+                    eth = data;
+                    if ((void *)(eth + 1) > data_end) return XDP_DROP;
+                    ip6h = (void *)(eth + 1);
+                    if ((void *)(ip6h + 1) > data_end) return XDP_DROP;
+                    udph = (void *)(ip6h + 1);
+                    if ((void *)(udph + 1) > data_end) return XDP_DROP;
 
-                // Write client's public IPv6 address
-                *payload = ip6h->saddr;
+                    struct in6_addr *legacy_payload = (void *)(udph + 1);
+                    if ((void *)(legacy_payload + 1) > data_end) return XDP_DROP;
+
+                    // Write client's public IPv6 address
+                    *legacy_payload = client_ip;
+                }
+
+                emit_pulse_event_v6(&client_ip, client_port_be, IPPROTO_UDP, 0);
 
                 // Swap MACs
                 __u8 tmp_mac[ETH_ALEN];
