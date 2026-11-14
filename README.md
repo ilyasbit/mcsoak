@@ -1,108 +1,80 @@
 # mcsoak
 
-Standalone soak testing target and in-process mock server library for Muterconn networks.
+Unified network & transport probe server for HTTP/1.1, HTTP/2, HTTP/3 (QUIC), eBPF XDP/TC reflection, passive TCP SYN fingerprinting, and authoritative DNS leak detection.
 
-`mcsoak` provides high-concurrency HTTP/1.1, HTTP/2, TLS, and WebSocket soak endpoints capable of verifying client connection pooling, keep-alives, burst decompressions, and TCP fingerprinting telemetry.
+## Architecture
 
-## Architecture Overview
+`mcsoak` consolidates multiple network diagnostic planes into a single Go binary (`cmd/mcsoak`):
 
-`mcsoak` is engineered with dual usage in mind:
-1. **Standalone Daemon**: Deployed as a continuous soak testing target (e.g. in Frankfurt WAN target on port `9443`) handling continuous synthetic traffic and thundering-herd scenarios.
-2. **In-process Library**: Can be embedded directly into Go test suites or integration test benches for sub-minute stress testing, race condition detection, and benchmark runs.
+- **HTTP/1.1 + HTTP/2 (`:8443` TCP/TLS)**: Serves diagnostic endpoints, WebSocket echo, synthetic HTML/asset waterfalls, and gzip burst payloads over TLS (loaded from disk or auto-generated ECDSA self-signed cert with SANs from `SOAK_PUBLIC_IPV4` / `SOAK_PUBLIC_IPV6`).
+- **HTTP/3 QUIC (`:9443` UDP)**: Optional `quic-go/http3` listener sharing the same route handler and TLS configuration.
+- **XDP/TC Pulse Reflector (`:7777` UDP/TCP)**: eBPF-accelerated packet reflector attached to `-iface`. Filters internet background noise using a 4-byte `"MCP\x00"` / `"MCP\x01"` UDP magic header and a 1-byte `0x4D` TCP SYN-cookie ISN noise filter.
+- **In-Process TCP SYN Fingerprinter (`AF_PACKET`)**: Captures incoming TCP SYN packets on `-iface` for the configured `-listen` port and stores passive OS/stack fingerprints keyed by client IP.
+- **Authoritative DNS Leak Oracle (`:53` UDP/TCP)**: 32K ring-buffer authoritative DNS server for `-dns-domain` (default `sight.muterconn.com`) that records client resolver queries for leak verification.
 
-```
-+-------------------------------------------------------------+
-|                        mcsoak Server                        |
-|                                                             |
-|  /health            - Health check (200 OK)                 |
-|  /api/echo          - Echoes client headers, proto, TLS     |
-|  /api/fingerprint   - Echoes headers + queries tcp-fp       |
-|  /ws                - WebSocket RFC 6455 echo & ping/pong   |
-|  /page              - HTML5 page referencing 50 subassets   |
-|  /assets/           - Deterministic JS/CSS/SVG payloads     |
-|  /burst             - Pre-gzipped 10KB JSON payload         |
-+------------------------------+------------------------------+
-                               |
-                (Optional internal query)
-                               v
-                  +-------------------------+
-                  |      tcp-fp Daemon      |
-                  |    (:8080/check?ip=...) |
-                  +-------------------------+
-```
+## CLI Flags & Environment Variables
 
-## Endpoints Specification
+CLI flags override environment variables, which fall back to defaults:
 
-- `GET /health`:
-  Returns `{"status": "ok", "time": "<RFC3339Nano>"}` with `200 OK`.
-- `GET /api/echo`:
-  Returns client IP, protocol, TLS metadata (version, cipher suite, negotiated ALPN), and request headers.
-- `GET /api/fingerprint`:
-  Same as `/api/echo`, but also queries a local or remote `tcp-fp` daemon (`?ip=<clientIP>`) within 500ms and merges the resulting TCP fingerprint object.
-- `GET /ws`:
-  WebSocket endpoint supporting text and binary bidirectional frame echo and ping/pong keepalive frames.
-- `GET /page`:
-  Lightweight HTML page requesting 50 sub-resources (15 CSS stylesheets, 10 SVG icons, 25 JS scripts) and establishing a WebSocket connection.
-- `GET /assets/(chunk|style|img)_<index>.(js|css|svg)`:
-  Dynamically generated, deterministic 2KB assets with appropriate MIME types for multiplexing and asset pipelining soak tests.
-- `GET /burst`:
-  Returns a pre-compressed ~10KB payload with `Content-Encoding: gzip` to test decompression pipelines under high load.
+| Flag | Env Var | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-listen` | `SOAK_LISTEN` | `:8443` | HTTPS / HTTP/2 listen address |
+| `-quic` | `SOAK_QUIC` | `true` | Enable HTTP/3 QUIC listener |
+| `-quic-listen` | `SOAK_QUIC_LISTEN` | `:9443` | HTTP/3 QUIC UDP listen address |
+| `-token` | `SOAK_TOKEN` | `""` | Static bearer/query auth token (empty disables auth) |
+| `-cert` | `SOAK_CERT` | `""` | Path to TLS certificate file |
+| `-key` | `SOAK_KEY` | `""` | Path to TLS private key file |
+| `-iface` | `SOAK_IFACE` | `eth0` | Network interface for eBPF reflector & `AF_PACKET` sniffer |
+| `-reflector` | `SOAK_REFLECTOR` | `false` | Enable eBPF XDP/TC pulse reflector |
+| `-tcpfp-sniff` | `SOAK_TCPFP_SNIFF` | `false` | Enable in-process `AF_PACKET` TCP SYN sniffer |
+| `-dnsleak` | `SOAK_DNSLEAK` | `false` | Enable authoritative DNS leak oracle |
+| `-dns-listen` | `SOAK_DNS_LISTEN` | `:53` | DNS leak oracle listen address |
+| `-dns-domain` | `SOAK_DNS_DOMAIN` | `sight.muterconn.com` | Base domain for DNS leak oracle |
+| — | `SOAK_PUBLIC_IPV4` | `""` | Public IPv4 added to auto-generated TLS SANs |
+| — | `SOAK_PUBLIC_IPV6` | `""` | Public IPv6 added to auto-generated TLS SANs |
 
-## CLI Usage
+## HTTP Routes & Authentication
 
-```bash
-# Run with auto-generated self-signed certificates
-go run ./cmd/mcsoak -listen :9443
+When `-token` / `SOAK_TOKEN` is non-empty, all routes **except `/health`** require authentication via either:
+- Header: `Authorization: Bearer <token>`
+- Query parameter: `?token=<token>`
 
-# Run with custom TLS certificates and TCP fingerprint daemon integration
-go run ./cmd/mcsoak \
-  -listen :9443 \
-  -cert /path/to/cert.pem \
-  -key /path/to/key.pem \
-  -tcpfp http://127.0.0.1:8080
-```
+Token comparison uses constant-time comparison (`subtle.ConstantTimeCompare`). Unauthenticated requests receive `401 Unauthorized`.
 
-Configuration can also be passed via environment variables:
-- `MCSOAK_LISTEN` (default: `:9443`)
-- `MCSOAK_CERT_FILE`
-- `MCSOAK_KEY_FILE`
-- `MCSOAK_TCP_FP_URL` (default: `http://127.0.0.1:8080`)
+| Route | Auth | Description |
+| :--- | :--- | :--- |
+| `/health` | Public | Returns `{"status":"ok","time":"..."}` for liveness/deployment checks |
+| `/echo` | Protected | Echoes client IP, HTTP protocol, TLS info, headers, and matched TCP fingerprint |
+| `/fp` | Protected | Returns passive TCP SYN fingerprint for client IP (or `?ip=<addr>`) |
+| `/dns` | Protected | Registers a DNS leak test token with the DNS leak oracle |
+| `/dns/check` | Protected | Queries observed DNS lookups for a registered leak token |
+| `/reflector/stats` | Protected | Returns eBPF reflector packet/byte counters (`?ips=true` includes source IPs) |
+| `/ws` | Protected | WebSocket echo endpoint (text/binary + ping/pong) |
+| `/page` | Protected | Synthetic HTML page referencing 15 CSS, 10 SVG, and 25 JS sub-resources + `/ws` |
+| `/assets/` | Protected | Serves deterministic sub-resources (`/assets/(chunk\|style\|img)_<n>.(js\|css\|svg)`) |
+| `/burst` | Protected | Serves a pre-compressed ~10 KB gzipped JSON payload |
 
-## In-Process Library Usage
+## Deployment & Rollback
 
-```go
-package main
-
-import (
-    "net/http/httptest"
-    "github.com/ilyasbit/mcsoak"
-)
-
-func main() {
-    srv := mcsoak.NewServer("http://127.0.0.1:8080")
-    ts := httptest.NewServer(srv.Routes())
-    defer ts.Close()
-
-    // Execute soak or benchmark requests against ts.URL
-}
-```
-
-## Running Tests
-
-Run the test suite with the race detector enabled:
+`scripts/deploy.sh` provides a deterministic, idempotent installer and updater for Debian/Ubuntu hosts:
 
 ```bash
-go test -v -race ./...
-go vet ./...
+# Build from source and deploy
+sudo ./scripts/deploy.sh
+
+# Deploy a pre-built binary
+sudo ./scripts/deploy.sh --binary ./mcsoak
+
+# Preview actions without modifying the system
+./scripts/deploy.sh --dry-run
+
+# Overwrite /etc/default/mcsoak with the default template
+sudo ./scripts/deploy.sh --reconfigure
 ```
 
-## Deployment
+### Release Layout & Automatic Rollback
 
-Deployment automation for Frankfurt WAN target (`de1.muterconn.com`) is provided in `scripts/deploy.sh`:
-
-```bash
-chmod +x scripts/deploy.sh
-./scripts/deploy.sh
-```
-
-The script cross-compiles a static `linux/arm64` binary, transfers it to the target host via SCP, configures and restarts the systemd unit `mc-soak-server`, and verifies the remote `/health` endpoint over IPv6/HTTPS.
+- Releases are installed into `/opt/mcsoak/releases/<git-sha>/mcsoak` with an atomic symlink `/opt/mcsoak/current` (keeping the last 3 releases).
+- Runs as a dedicated `mcsoak` system user with `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_BPF CAP_PERFMON` (no full root required).
+- Applies QUIC/XDP kernel buffer tuning in `/etc/sysctl.d/99-mcsoak.conf` and preserves operator edits in `/etc/default/mcsoak`.
+- After `systemctl restart mcsoak`, the script polls `https://127.0.0.1:8443/health`. If health verification fails, `/opt/mcsoak/current` is automatically rolled back to the previous release and `mcsoak` is restarted.
