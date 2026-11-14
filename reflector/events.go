@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
+	"time"
 )
 
 const pulseEventSize = 32
@@ -56,4 +58,100 @@ func DecodePulseEvent(raw []byte) (PulseEvent, error) {
 		IPVersion:   ipVer,
 		Flags:       flags,
 	}, nil
+}
+
+// StatsSnapshot holds an immutable point-in-time view of reflector pulse statistics.
+type StatsSnapshot struct {
+	TotalPulses uint64    `json:"total_pulses"`
+	UDPPulses   uint64    `json:"udp_pulses"`
+	TCPPulses   uint64    `json:"tcp_pulses"`
+	IPv4Pulses  uint64    `json:"ipv4_pulses"`
+	IPv6Pulses  uint64    `json:"ipv6_pulses"`
+	LastPulseAt time.Time `json:"last_pulse_at,omitempty"`
+	RecentIPs   []string  `json:"recent_ips,omitempty"`
+}
+
+// StatsTracker aggregates pulse telemetry events in a thread-safe manner.
+type StatsTracker struct {
+	mu          sync.RWMutex
+	maxRecent   int
+	totalPulses uint64
+	udpPulses   uint64
+	tcpPulses   uint64
+	ipv4Pulses  uint64
+	ipv6Pulses  uint64
+	lastPulseAt time.Time
+	recentIPs   []string
+	seenIPs     map[string]struct{}
+}
+
+// NewStatsTracker creates a StatsTracker retaining at most maxRecent unique recent source IPs.
+func NewStatsTracker(maxRecent int) *StatsTracker {
+	if maxRecent < 0 {
+		maxRecent = 0
+	}
+	return &StatsTracker{
+		maxRecent: maxRecent,
+		seenIPs:   make(map[string]struct{}),
+	}
+}
+
+// Record updates pulse counters and recent source IP tracking for a single PulseEvent.
+func (st *StatsTracker) Record(ev PulseEvent) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	st.totalPulses++
+	switch ev.Proto {
+	case 17:
+		st.udpPulses++
+	case 6:
+		st.tcpPulses++
+	}
+	switch ev.IPVersion {
+	case 4:
+		st.ipv4Pulses++
+	case 6:
+		st.ipv6Pulses++
+	}
+	st.lastPulseAt = time.Now().UTC()
+
+	if st.maxRecent > 0 && ev.SrcAddr.IsValid() {
+		ipStr := ev.SrcAddr.String()
+		if _, exists := st.seenIPs[ipStr]; exists {
+			// Move existing IP to the end as most recent.
+			for i, existing := range st.recentIPs {
+				if existing == ipStr {
+					st.recentIPs = append(st.recentIPs[:i], st.recentIPs[i+1:]...)
+					break
+				}
+			}
+		} else if len(st.recentIPs) >= st.maxRecent {
+			oldest := st.recentIPs[0]
+			st.recentIPs = st.recentIPs[1:]
+			delete(st.seenIPs, oldest)
+		}
+		st.seenIPs[ipStr] = struct{}{}
+		st.recentIPs = append(st.recentIPs, ipStr)
+	}
+}
+
+// Snapshot returns a copy of the aggregated pulse statistics, optionally including recent source IPs.
+func (st *StatsTracker) Snapshot(includeIPs bool) StatsSnapshot {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	snap := StatsSnapshot{
+		TotalPulses: st.totalPulses,
+		UDPPulses:   st.udpPulses,
+		TCPPulses:   st.tcpPulses,
+		IPv4Pulses:  st.ipv4Pulses,
+		IPv6Pulses:  st.ipv6Pulses,
+		LastPulseAt: st.lastPulseAt,
+	}
+	if includeIPs && len(st.recentIPs) > 0 {
+		snap.RecentIPs = make([]string, len(st.recentIPs))
+		copy(snap.RecentIPs, st.recentIPs)
+	}
+	return snap
 }

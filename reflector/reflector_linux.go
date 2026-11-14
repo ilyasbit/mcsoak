@@ -132,11 +132,42 @@ func StartWithEvents(ifaceName string, handler EventHandler) (io.Closer, error) 
 	}
 	log.Printf("eBPF TC Egress Filter successfully attached to %s", ifaceName)
 
-	return &reflectorHandle{
+	h := &reflectorHandle{
 		ifaceName: ifaceName,
 		nlLink:    nlLink,
 		objs:      objs,
 		xdpLink:   xdpLink,
 		tcFilter:  filter,
-	}, nil
+	}
+
+	if handler != nil {
+		ringRd, err := ringbuf.NewReader(objs.PulseEvents)
+		if err != nil {
+			_ = h.Close()
+			return nil, fmt.Errorf("failed to open pulse_events ring buffer: %w", err)
+		}
+		h.ringRd = ringRd
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			for {
+				rec, err := ringRd.Read()
+				if err != nil {
+					if errors.Is(err, ringbuf.ErrClosed) {
+						return
+					}
+					log.Printf("Warning: ringbuf read error on %s: %v", ifaceName, err)
+					continue
+				}
+				ev, err := DecodePulseEvent(rec.RawSample)
+				if err != nil {
+					log.Printf("Warning: failed to decode pulse event on %s: %v", ifaceName, err)
+					continue
+				}
+				handler(ev)
+			}
+		}()
+	}
+
+	return h, nil
 }

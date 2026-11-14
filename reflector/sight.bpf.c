@@ -398,6 +398,9 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
 
             if (tcph->dest == bpf_htons(TARGET_PORT)) {
                 if (tcph->syn) {
+                    if ((bpf_ntohl(tcph->seq) & 0xFF) != 0x4D) {
+                        return XDP_DROP;
+                    }
                     // TCP Handshake Spoofing over IPv6 (SYN -> SYN-ACK)
                     emit_pulse_event_v6(&ip6h->saddr, tcph->source, IPPROTO_TCP, 0x02);
 
