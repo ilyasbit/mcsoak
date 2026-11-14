@@ -5,13 +5,16 @@ package reflector
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf sight.bpf.c -- -I/usr/include/bpf
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -22,15 +25,25 @@ type reflectorHandle struct {
 	objs      bpfObjects
 	xdpLink   link.Link
 	tcFilter  *netlink.BpfFilter
+	ringRd    *ringbuf.Reader
+	wg        sync.WaitGroup
 }
 
 func (h *reflectorHandle) Close() error {
 	log.Printf("Detaching eBPF programs from %s...", h.ifaceName)
 	var firstErr error
+	if h.ringRd != nil {
+		if err := h.ringRd.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+			firstErr = err
+		}
+		h.wg.Wait()
+	}
 	if h.tcFilter != nil {
 		if err := netlink.FilterDel(h.tcFilter); err != nil {
 			log.Printf("Warning: Failed to clean up TC Egress filter: %v", err)
-			firstErr = err
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	if h.xdpLink != nil {
@@ -51,6 +64,12 @@ func (h *reflectorHandle) Close() error {
 // Start loads and attaches the XDP pulse reflector and TC clsact egress RST drop filter
 // to the specified network interface.
 func Start(ifaceName string) (io.Closer, error) {
+	return StartWithEvents(ifaceName, nil)
+}
+
+// StartWithEvents loads and attaches the XDP pulse reflector and TC clsact egress RST drop filter,
+// and if handler is non-nil, streams decoded PulseEvent records from the BPF ring buffer.
+func StartWithEvents(ifaceName string, handler EventHandler) (io.Closer, error) {
 	if ifaceName == "" {
 		ifaceName = "eth0"
 	}
@@ -113,11 +132,42 @@ func Start(ifaceName string) (io.Closer, error) {
 	}
 	log.Printf("eBPF TC Egress Filter successfully attached to %s", ifaceName)
 
-	return &reflectorHandle{
+	h := &reflectorHandle{
 		ifaceName: ifaceName,
 		nlLink:    nlLink,
 		objs:      objs,
 		xdpLink:   xdpLink,
 		tcFilter:  filter,
-	}, nil
+	}
+
+	if handler != nil {
+		ringRd, err := ringbuf.NewReader(objs.PulseEvents)
+		if err != nil {
+			_ = h.Close()
+			return nil, fmt.Errorf("failed to open pulse_events ring buffer: %w", err)
+		}
+		h.ringRd = ringRd
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			for {
+				rec, err := ringRd.Read()
+				if err != nil {
+					if errors.Is(err, ringbuf.ErrClosed) {
+						return
+					}
+					log.Printf("Warning: ringbuf read error on %s: %v", ifaceName, err)
+					continue
+				}
+				ev, err := DecodePulseEvent(rec.RawSample)
+				if err != nil {
+					log.Printf("Warning: failed to decode pulse event on %s: %v", ifaceName, err)
+					continue
+				}
+				handler(ev)
+			}
+		}()
+	}
+
+	return h, nil
 }
