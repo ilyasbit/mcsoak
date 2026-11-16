@@ -120,6 +120,15 @@ func (s *Store) Record(sessionID string, rec QueryRecord) {
 			}
 			return
 		}
+		if sl.occupied {
+			sl.occupied = false
+			sl.sessionID = ""
+			sl.hitCount = 0
+			sl.createdAt = time.Time{}
+			sl.expiresAt = time.Time{}
+			sl.queries = sl.queries[:0]
+			s.count--
+		}
 		delete(s.index, id)
 	}
 
