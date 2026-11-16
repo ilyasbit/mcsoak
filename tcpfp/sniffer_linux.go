@@ -45,6 +45,15 @@ func StartSniffer(ctx context.Context, ifaceName string, port uint16, store *Sto
 		}
 	}
 
+	insns := buildTCPSYNBPF(port)
+	fprog := unix.SockFprog{
+		Len:    uint16(len(insns)),
+		Filter: &insns[0],
+	}
+	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &fprog); err != nil {
+		return fmt.Errorf("tcpfp: attach BPF filter: %w", err)
+	}
+
 	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 	buf := make([]byte, 65536)
 
@@ -80,6 +89,109 @@ func StartSniffer(ctx context.Context, ifaceName string, port uint16, store *Sto
 			continue
 		}
 		store.Record(*fp)
+	}
+}
+
+func buildTCPSYNBPF(port uint16) []unix.SockFilter {
+	const (
+		ldhAbs  = unix.BPF_LD | unix.BPF_H | unix.BPF_ABS
+		ldbAbs  = unix.BPF_LD | unix.BPF_B | unix.BPF_ABS
+		ldxMsh  = unix.BPF_LDX | unix.BPF_B | unix.BPF_MSH
+		ldbInd  = unix.BPF_LD | unix.BPF_B | unix.BPF_IND
+		ldhInd  = unix.BPF_LD | unix.BPF_H | unix.BPF_IND
+		aluAndK = unix.BPF_ALU | unix.BPF_AND | unix.BPF_K
+		jmpJeqK = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
+		jmpJset = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
+		retK    = unix.BPF_RET | unix.BPF_K
+	)
+
+	if port > 0 {
+		p := uint32(port)
+		return []unix.SockFilter{
+			// 0: EtherType
+			{Code: ldhAbs, K: 12},
+			// 1: IPv4 -> 2; else -> 12 (IPv6)
+			{Code: jmpJeqK, Jt: 0, Jf: 10, K: ethTypeIPv4},
+			// 2: IPv4 protocol == TCP
+			{Code: ldbAbs, K: 23},
+			// 3: TCP -> 4; else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 17, K: ipProtoTCP},
+			// 4: IPv4 flags & fragment offset
+			{Code: ldhAbs, K: 20},
+			// 5: fragmented -> 21 (drop); else -> 6
+			{Code: jmpJset, Jt: 15, Jf: 0, K: 0x1fff},
+			// 6: X = IPv4 header length
+			{Code: ldxMsh, K: 14},
+			// 7: TCP flags at 14 + X + 13
+			{Code: ldbInd, K: 27},
+			// 8: mask SYN | ACK
+			{Code: aluAndK, K: tcpFlagSYN | tcpFlagACK},
+			// 9: pure SYN -> 10; else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 11, K: tcpFlagSYN},
+			// 10: TCP dst port at 14 + X + 2
+			{Code: ldhInd, K: 16},
+			// 11: port match -> 20 (accept); else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 8, Jf: 9, K: p},
+			// 12: IPv6 -> 13; else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 8, K: ethTypeIPv6},
+			// 13: IPv6 Next Header == TCP
+			{Code: ldbAbs, K: 20},
+			// 14: TCP -> 15; else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 6, K: ipProtoTCP},
+			// 15: IPv6 TCP flags at 14 + 40 + 13
+			{Code: ldbAbs, K: 67},
+			// 16: mask SYN | ACK
+			{Code: aluAndK, K: tcpFlagSYN | tcpFlagACK},
+			// 17: pure SYN -> 18; else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 3, K: tcpFlagSYN},
+			// 18: IPv6 TCP dst port at 14 + 40 + 2
+			{Code: ldhAbs, K: 56},
+			// 19: port match -> 20 (accept); else -> 21 (drop)
+			{Code: jmpJeqK, Jt: 0, Jf: 1, K: p},
+			// 20: accept
+			{Code: retK, K: 0x40000},
+			// 21: drop
+			{Code: retK, K: 0},
+		}
+	}
+
+	return []unix.SockFilter{
+		// 0: EtherType
+		{Code: ldhAbs, K: 12},
+		// 1: IPv4 -> 2; else -> 10 (IPv6)
+		{Code: jmpJeqK, Jt: 0, Jf: 8, K: ethTypeIPv4},
+		// 2: IPv4 protocol == TCP
+		{Code: ldbAbs, K: 23},
+		// 3: TCP -> 4; else -> 17 (drop)
+		{Code: jmpJeqK, Jt: 0, Jf: 13, K: ipProtoTCP},
+		// 4: IPv4 flags & fragment offset
+		{Code: ldhAbs, K: 20},
+		// 5: fragmented -> 17 (drop); else -> 6
+		{Code: jmpJset, Jt: 11, Jf: 0, K: 0x1fff},
+		// 6: X = IPv4 header length
+		{Code: ldxMsh, K: 14},
+		// 7: TCP flags at 14 + X + 13
+		{Code: ldbInd, K: 27},
+		// 8: mask SYN | ACK
+		{Code: aluAndK, K: tcpFlagSYN | tcpFlagACK},
+		// 9: pure SYN -> 16 (accept); else -> 17 (drop)
+		{Code: jmpJeqK, Jt: 6, Jf: 7, K: tcpFlagSYN},
+		// 10: IPv6 -> 11; else -> 17 (drop)
+		{Code: jmpJeqK, Jt: 0, Jf: 6, K: ethTypeIPv6},
+		// 11: IPv6 Next Header == TCP
+		{Code: ldbAbs, K: 20},
+		// 12: TCP -> 13; else -> 17 (drop)
+		{Code: jmpJeqK, Jt: 0, Jf: 4, K: ipProtoTCP},
+		// 13: IPv6 TCP flags at 14 + 40 + 13
+		{Code: ldbAbs, K: 67},
+		// 14: mask SYN | ACK
+		{Code: aluAndK, K: tcpFlagSYN | tcpFlagACK},
+		// 15: pure SYN -> 16 (accept); else -> 17 (drop)
+		{Code: jmpJeqK, Jt: 0, Jf: 1, K: tcpFlagSYN},
+		// 16: accept
+		{Code: retK, K: 0x40000},
+		// 17: drop
+		{Code: retK, K: 0},
 	}
 }
 

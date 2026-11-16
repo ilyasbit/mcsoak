@@ -7,10 +7,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -100,32 +104,158 @@ func GenerateSelfSignedCert(hosts ...string) (tls.Certificate, error) {
 
 // LoadOrGenerateTLS loads certificates from disk or generates a new self-signed certificate.
 func LoadOrGenerateTLS(certPath, keyPath string, hosts ...string) (*tls.Config, error) {
+	if (certPath == "") != (keyPath == "") {
+		return nil, errors.New("tls: both certPath and keyPath must be provided together")
+	}
+
 	var cert tls.Certificate
 	var err error
 
-	if certPath != "" && keyPath != "" {
-		if _, errCert := os.Stat(certPath); errCert == nil {
-			if _, errKey := os.Stat(keyPath); errKey == nil {
-				cert, err = tls.LoadX509KeyPair(certPath, keyPath)
-				if err != nil {
-					return nil, fmt.Errorf("failed to load key pair: %w", err)
-				}
-			}
-		}
-	}
-
-	if len(cert.Certificate) == 0 {
+	if certPath == "" && keyPath == "" {
 		cert, err = GenerateSelfSignedCert(hosts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate self-signed cert: %w", err)
+		}
+	} else {
+		cert, err = loadOrPersistCert(certPath, keyPath, hosts...)
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h3", "h2", "http/1.1"},
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return &cert, nil
+		},
+		NextProtos: []string{"h3", "h2", "http/1.1"},
+		MinVersion: tls.VersionTLS12,
 	}
 
 	return tlsConfig, nil
+}
+
+func loadOrPersistCert(certPath, keyPath string, hosts ...string) (tls.Certificate, error) {
+	sanHosts := BuildSANHosts(hosts...)
+
+	_, errCert := os.Stat(certPath)
+	if errCert != nil && !os.IsNotExist(errCert) {
+		return tls.Certificate{}, fmt.Errorf("failed to stat cert %q: %w", certPath, errCert)
+	}
+	_, errKey := os.Stat(keyPath)
+	if errKey != nil && !os.IsNotExist(errKey) {
+		return tls.Certificate{}, fmt.Errorf("failed to stat key %q: %w", keyPath, errKey)
+	}
+
+	if errCert == nil && errKey == nil {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("failed to load key pair: %w", err)
+		}
+		leaf := cert.Leaf
+		if leaf == nil {
+			leaf, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return tls.Certificate{}, fmt.Errorf("failed to parse leaf certificate: %w", err)
+			}
+			cert.Leaf = leaf
+		}
+		if isCertValidForHosts(leaf, sanHosts) {
+			return cert, nil
+		}
+	}
+
+	cert, err := GenerateSelfSignedCert(hosts...)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to generate self-signed cert: %w", err)
+	}
+	if err := persistCertAndKey(certPath, keyPath, cert); err != nil {
+		return tls.Certificate{}, err
+	}
+	return cert, nil
+}
+
+func isCertValidForHosts(leaf *x509.Certificate, sanHosts []string) bool {
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter.Add(-24*time.Hour)) {
+		return false
+	}
+	for _, h := range sanHosts {
+		if ip := net.ParseIP(h); ip != nil {
+			found := false
+			for _, certIP := range leaf.IPAddresses {
+				if certIP.Equal(ip) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		} else {
+			found := false
+			for _, dns := range leaf.DNSNames {
+				if strings.EqualFold(dns, h) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func persistCertAndKey(certPath, keyPath string, cert tls.Certificate) error {
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to marshal private key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
+
+	if err := writeFileAtomic(certPath, certPEM, 0o644); err != nil {
+		return fmt.Errorf("failed to write cert %q: %w", certPath, err)
+	}
+	if err := writeFileAtomic(keyPath, keyPEM, 0o600); err != nil {
+		return fmt.Errorf("failed to write key %q: %w", keyPath, err)
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
