@@ -171,8 +171,8 @@ func TestTokenAuthMiddleware(t *testing.T) {
 }
 
 func TestIPBasedTLSSANs(t *testing.T) {
-	t.Setenv("SOAK_PUBLIC_IPV4", "198.51.100.77")
-	t.Setenv("SOAK_PUBLIC_IPV6", "2001:db8::77")
+	t.Setenv("MCSOAK_PUBLIC_IPV4", "198.51.100.77")
+	t.Setenv("MCSOAK_PUBLIC_IPV6", "2001:db8::77")
 
 	tlsConfig, err := LoadOrGenerateTLS("", "")
 	if err != nil {
