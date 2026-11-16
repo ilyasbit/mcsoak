@@ -6,7 +6,7 @@ Unified network & transport probe server for HTTP/1.1, HTTP/2, HTTP/3 (QUIC), eB
 
 `mcsoak` consolidates multiple network diagnostic planes into a single Go binary (`cmd/mcsoak`):
 
-- **HTTP/1.1 + HTTP/2 (`:8443` TCP/TLS)**: Serves diagnostic endpoints, WebSocket echo, synthetic HTML/asset waterfalls, and gzip burst payloads over TLS (loaded from disk or auto-generated ECDSA self-signed cert with SANs from `SOAK_PUBLIC_IPV4` / `SOAK_PUBLIC_IPV6`).
+- **HTTP/1.1 + HTTP/2 (`:8443` TCP/TLS)**: Serves diagnostic endpoints, WebSocket echo, synthetic HTML/asset waterfalls, and gzip burst payloads over TLS (loaded from disk or auto-generated ECDSA self-signed cert with SANs from `MCSOAK_PUBLIC_IPV4` / `MCSOAK_PUBLIC_IPV6`).
 - **HTTP/3 QUIC (`:9443` UDP)**: Optional `quic-go/http3` listener sharing the same route handler and TLS configuration.
 - **XDP/TC Pulse Reflector (`:7777` UDP/TCP)**: eBPF-accelerated packet reflector attached to `-iface`. Filters internet background noise using a 4-byte `"MCP\x00"` / `"MCP\x01"` UDP magic header and a 1-byte `0x4D` TCP SYN-cookie ISN noise filter.
 - **In-Process TCP SYN Fingerprinter (`AF_PACKET`)**: Captures incoming TCP SYN packets on `-iface` for the configured `-listen` port and stores passive OS/stack fingerprints keyed by client IP.
@@ -18,24 +18,25 @@ CLI flags override environment variables, which fall back to defaults:
 
 | Flag | Env Var | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-listen` | `SOAK_LISTEN` | `:8443` | HTTPS / HTTP/2 listen address |
-| `-quic` | `SOAK_QUIC` | `true` | Enable HTTP/3 QUIC listener |
-| `-quic-listen` | `SOAK_QUIC_LISTEN` | `:9443` | HTTP/3 QUIC UDP listen address |
-| `-token` | `SOAK_TOKEN` | `""` | Static bearer/query auth token (empty disables auth) |
-| `-cert` | `SOAK_CERT` | `""` | Path to TLS certificate file |
-| `-key` | `SOAK_KEY` | `""` | Path to TLS private key file |
-| `-iface` | `SOAK_IFACE` | `eth0` | Network interface for eBPF reflector & `AF_PACKET` sniffer |
-| `-reflector` | `SOAK_REFLECTOR` | `false` | Enable eBPF XDP/TC pulse reflector |
-| `-tcpfp-sniff` | `SOAK_TCPFP_SNIFF` | `false` | Enable in-process `AF_PACKET` TCP SYN sniffer |
-| `-dnsleak` | `SOAK_DNSLEAK` | `false` | Enable authoritative DNS leak oracle |
-| `-dns-listen` | `SOAK_DNS_LISTEN` | `:53` | DNS leak oracle listen address |
-| `-dns-domain` | `SOAK_DNS_DOMAIN` | `sight.muterconn.com` | Base domain for DNS leak oracle |
-| — | `SOAK_PUBLIC_IPV4` | `""` | Public IPv4 added to auto-generated TLS SANs |
-| — | `SOAK_PUBLIC_IPV6` | `""` | Public IPv6 added to auto-generated TLS SANs |
+| `-listen` | `MCSOAK_LISTEN` | `:8443` | HTTPS / HTTP/2 listen address |
+| `-quic` | `MCSOAK_QUIC` | `true` | Enable HTTP/3 QUIC listener |
+| `-quic-listen` | `MCSOAK_QUIC_LISTEN` | `:9443` | HTTP/3 QUIC UDP listen address |
+| `-token` | `MCSOAK_TOKEN` | `""` | Static bearer/query auth token (empty disables auth) |
+| `-cert` | `MCSOAK_CERT` | `""` | Path to TLS certificate file |
+| `-key` | `MCSOAK_KEY` | `""` | Path to TLS private key file |
+| `-iface` | `MCSOAK_IFACE` | `eth0` | Network interface for eBPF reflector & `AF_PACKET` sniffer |
+| `-reflector` | `MCSOAK_REFLECTOR` | `false` | Enable eBPF XDP/TC pulse reflector |
+| `-tcpfp-sniff` | `MCSOAK_TCPFP_SNIFF` | `false` | Enable in-process `AF_PACKET` TCP SYN sniffer |
+| `-dnsleak` | `MCSOAK_DNSLEAK` | `false` | Enable authoritative DNS leak oracle |
+| `-dns-listen` | `MCSOAK_DNS_LISTEN` | `:53` | DNS leak oracle listen address |
+| `-dns-domain` | `MCSOAK_DNS_DOMAIN` | `sight.muterconn.com` | Base domain for DNS leak oracle |
+| `-asn-db` | `MCSOAK_ASN_DB` | `""` | Path to MaxMind .mmdb ASN database |
+| — | `MCSOAK_PUBLIC_IPV4` | `""` | Public IPv4 added to auto-generated TLS SANs and DNS leak A echo |
+| — | `MCSOAK_PUBLIC_IPV6` | `""` | Public IPv6 added to auto-generated TLS SANs and DNS leak AAAA echo |
 
 ## HTTP Routes & Authentication
 
-When `-token` / `SOAK_TOKEN` is non-empty, all routes **except `/health`** require authentication via either:
+When `-token` / `MCSOAK_TOKEN` is non-empty, all routes **except `/health`** require authentication via either:
 - Header: `Authorization: Bearer <token>`
 - Query parameter: `?token=<token>`
 

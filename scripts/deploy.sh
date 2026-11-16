@@ -149,9 +149,9 @@ if [[ ! -f "${ENV_FILE}" || "${RECONFIGURE}" == "true" ]]; then
   ENV_TMP="$(mktemp)"
   cat > "${ENV_TMP}" <<'EOF'
 # mcsoak operator configuration
-SOAK_PUBLIC_IPV4=
-SOAK_PUBLIC_IPV6=
-SOAK_TOKEN=
+MCSOAK_PUBLIC_IPV4=
+MCSOAK_PUBLIC_IPV6=
+MCSOAK_TOKEN=
 MCSOAK_IFACE=eth0
 MCSOAK_FLAGS="-listen :8443 -quic=true -quic-listen :9443 -reflector -tcpfp-sniff -dnsleak -dns-listen :53 -dns-domain sight.muterconn.com"
 EOF

@@ -20,7 +20,7 @@ var DefaultHosts = []string{
 	"::1",
 }
 
-// BuildSANHosts collects default loopback SANs, SOAK_PUBLIC_IPV4/SOAK_PUBLIC_IPV6
+// BuildSANHosts collects default loopback SANs, MCSOAK_PUBLIC_IPV4/MCSOAK_PUBLIC_IPV6
 // environment variables, and any caller-supplied hosts/IPs, deduplicated.
 func BuildSANHosts(hosts ...string) []string {
 	seen := make(map[string]struct{})
@@ -39,8 +39,8 @@ func BuildSANHosts(hosts ...string) []string {
 	for _, h := range DefaultHosts {
 		add(h)
 	}
-	add(os.Getenv("SOAK_PUBLIC_IPV4"))
-	add(os.Getenv("SOAK_PUBLIC_IPV6"))
+	add(os.Getenv("MCSOAK_PUBLIC_IPV4"))
+	add(os.Getenv("MCSOAK_PUBLIC_IPV6"))
 	for _, h := range hosts {
 		add(h)
 	}
