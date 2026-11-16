@@ -145,6 +145,7 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *iph = (void *)(eth + 1);
         if ((void *)(iph + 1) > data_end) return XDP_PASS;
+        if (iph->ihl < 5) return XDP_PASS;
 
         if (iph->protocol == IPPROTO_UDP) {
             struct udphdr *udph = (void *)iph + (iph->ihl * 4);
@@ -183,6 +184,7 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                     if ((void *)(eth + 1) > data_end) return XDP_DROP;
                     iph = (void *)(eth + 1);
                     if ((void *)(iph + 1) > data_end) return XDP_DROP;
+                    if (iph->ihl < 5) return XDP_DROP;
                     udph = (void *)iph + (iph->ihl * 4);
                     if ((void *)(udph + 1) > data_end) return XDP_DROP;
 
