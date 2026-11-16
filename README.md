@@ -84,3 +84,18 @@ sudo ./scripts/deploy.sh --reconfigure
 - Applies QUIC/XDP kernel buffer tuning in `/etc/sysctl.d/99-mcsoak.conf` and preserves operator edits in `/etc/default/mcsoak`.
 - Validates that `MCSOAK_PUBLIC_IPV4` or `MCSOAK_PUBLIC_IPV6` is configured when `-dnsleak` is enabled, and derives the `/health` check port from `MCSOAK_LISTEN` / `-listen`.
 - After `systemctl restart mcsoak`, the script polls `https://127.0.0.1:<port>/health`. If health verification fails, `/opt/mcsoak/current` is automatically rolled back to the previous release and `mcsoak` is restarted.
+
+## Live Oracle E2E Smoke Suite
+
+`cmd/mcsoak-smoke` verifies all six diagnostic planes of a live `mcsoak` instance end-to-end:
+
+1. **Health & Auth**: `GET /health` returns `200`, and unauthenticated `GET /echo` returns `401` when `-token` / `MCSOAK_TOKEN` is set.
+2. **HTTPS / HTTP/2 (`:8443`)**: Verifies `GET /echo` (`HTTP/2.0`, `TLS 1.3`), `GET /fp`, `GET /asn` (`200` or `503`), `GET /burst` (`>= 9000` bytes), and `GET /page`.
+3. **HTTP/3 QUIC (`:9443`)**: Verifies `GET /echo` over `quic-go/http3` (`HTTP/3.0`).
+4. **WebSocket (`/ws`)**: Connects with bearer auth and asserts round-trip echo of `"mcsoak-smoke-ws"`.
+5. **DNS Leak Oracle**: Registers a token via `GET /dns`, queries `NS`/`SOA` for `-dns-domain` and `A` for `<id>.<dns-domain>` through `-dns-resolver`, and polls `GET /dns/check?id=<id>`.
+6. **eBPF Reflector (`:7777`)**: Sends a `MCP\x00` UDP pulse, verifies the reflected client IPv4/IPv6 payload, and confirms `total_pulses` increments via `GET /reflector/stats`.
+
+```bash
+go run ./cmd/mcsoak-smoke -host 89.58.24.50 -token "$MCSOAK_TOKEN"
+```
