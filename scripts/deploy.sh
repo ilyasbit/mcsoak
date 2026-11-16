@@ -153,7 +153,12 @@ MCSOAK_PUBLIC_IPV4=
 MCSOAK_PUBLIC_IPV6=
 MCSOAK_TOKEN=
 MCSOAK_IFACE=eth0
-MCSOAK_FLAGS="-listen :8443 -quic=true -quic-listen :9443 -reflector -tcpfp-sniff -dnsleak -dns-listen :53 -dns-domain sight.muterconn.com"
+MCSOAK_DNS_DOMAIN=dns.muterconn.com
+MCSOAK_DNS_NS=ns1.dns.muterconn.com,ns2.dns.muterconn.com
+MCSOAK_DNS_VALIDATE_NS=true
+MCSOAK_CERT=/var/lib/mcsoak/cert.pem
+MCSOAK_KEY=/var/lib/mcsoak/key.pem
+MCSOAK_FLAGS="-listen :8443 -quic=true -quic-listen :9443 -reflector -tcpfp-sniff -dnsleak"
 EOF
   run_cmd install -o root -g "${APP_NAME}" -m 0640 "${ENV_TMP}" "${ENV_FILE}"
   rm -f "${ENV_TMP}"
@@ -187,6 +192,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+StateDirectory=mcsoak
 ReadOnlyPaths=/opt/mcsoak
 
 [Install]
@@ -202,6 +208,57 @@ else
   log "${SERVICE_FILE} is already up to date"
 fi
 rm -f "${UNIT_TMP}"
+
+# Derive HEALTH_URL port and validate DNS leak public IP requirements from /etc/default/mcsoak
+derive_health_url() {
+  local listen_val=""
+  local port="8443"
+  if [[ -f "${ENV_FILE}" ]]; then
+    local env_listen=""
+    local env_flags=""
+    env_listen="$(grep -E '^MCSOAK_LISTEN=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+    env_flags="$(grep -E '^MCSOAK_FLAGS=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+    if [[ "${env_flags}" =~ -listen[[:space:]]+([^[:space:]]+) ]]; then
+      listen_val="${BASH_REMATCH[1]}"
+    elif [[ -n "${env_listen}" ]]; then
+      listen_val="${env_listen}"
+    fi
+  fi
+  if [[ -n "${listen_val}" && "${listen_val}" =~ :([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  HEALTH_URL="https://127.0.0.1:${port}/health"
+}
+
+validate_dnsleak_env() {
+  if [[ "${DRY_RUN}" == "true" || ! -f "${ENV_FILE}" ]]; then
+    return 0
+  fi
+  local dnsleak_enabled=false
+  local env_dnsleak=""
+  local env_flags=""
+  env_dnsleak="$(grep -E '^MCSOAK_DNSLEAK=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs || true)"
+  env_flags="$(grep -E '^MCSOAK_FLAGS=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+  if [[ "${env_dnsleak}" == "true" || "${env_dnsleak}" == "1" || "${env_dnsleak}" == "yes" ]]; then
+    dnsleak_enabled=true
+  elif [[ "${env_flags}" =~ (^|[[:space:]])-dnsleak(=true)?([[:space:]]|$) ]]; then
+    dnsleak_enabled=true
+  fi
+  if [[ "${dnsleak_enabled}" == "true" ]]; then
+    local pub_v4=""
+    local pub_v6=""
+    pub_v4="$(grep -E '^MCSOAK_PUBLIC_IPV4=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs || true)"
+    pub_v6="$(grep -E '^MCSOAK_PUBLIC_IPV6=' "${ENV_FILE}" | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs || true)"
+    if [[ -z "${pub_v4}" && -z "${pub_v6}" ]]; then
+      echo "Error: -dnsleak is enabled in ${ENV_FILE}, but both MCSOAK_PUBLIC_IPV4 and MCSOAK_PUBLIC_IPV6 are empty." >&2
+      echo "Please set at least one public IP in ${ENV_FILE} before restarting ${APP_NAME}." >&2
+      exit 1
+    fi
+  fi
+}
+
+derive_health_url
+validate_dnsleak_env
 
 # 6. Atomic symlink switch with rollback tracking
 PREV_TARGET=""
