@@ -48,20 +48,38 @@ func parseListenPort(addr string) uint16 {
 	return uint16(p)
 }
 
+func buildDNSLeakConfig(addr, domain string) dnsleak.Config {
+	cfg := dnsleak.Config{
+		Addr:       addr,
+		BaseDomain: domain,
+	}
+	if rawV4 := getEnv("MCSOAK_PUBLIC_IPV4", ""); rawV4 != "" {
+		if ip := net.ParseIP(rawV4); ip != nil && ip.To4() != nil {
+			cfg.EchoIPv4 = ip.To4()
+		}
+	}
+	if rawV6 := getEnv("MCSOAK_PUBLIC_IPV6", ""); rawV6 != "" {
+		if ip := net.ParseIP(rawV6); ip != nil && ip.To4() == nil {
+			cfg.EchoIPv6 = ip
+		}
+	}
+	return cfg
+}
+
 func main() {
-	listenFlag := flag.String("listen", getEnv("SOAK_LISTEN", ":8443"), "HTTPS/H2 listen address")
-	quicFlag := flag.Bool("quic", getEnvBool("SOAK_QUIC", true), "Enable HTTP/3 QUIC listener")
-	quicListenFlag := flag.String("quic-listen", getEnv("SOAK_QUIC_LISTEN", ":9443"), "HTTP/3 QUIC UDP listen address")
-	tokenFlag := flag.String("token", getEnv("SOAK_TOKEN", ""), "Static bearer/query auth token")
-	certFlag := flag.String("cert", getEnv("SOAK_CERT", ""), "Path to TLS certificate file")
-	keyFlag := flag.String("key", getEnv("SOAK_KEY", ""), "Path to TLS private key file")
-	ifaceFlag := flag.String("iface", getEnv("SOAK_IFACE", "eth0"), "Network interface for reflector & tcpfp sniffer")
-	reflectorFlag := flag.Bool("reflector", getEnvBool("SOAK_REFLECTOR", false), "Enable eBPF pulse reflector")
-	tcpfpSniffFlag := flag.Bool("tcpfp-sniff", getEnvBool("SOAK_TCPFP_SNIFF", false), "Enable in-process AF_PACKET TCP SYN sniffer")
-	dnsleakFlag := flag.Bool("dnsleak", getEnvBool("SOAK_DNSLEAK", false), "Enable authoritative DNS leak oracle")
-	dnsListenFlag := flag.String("dns-listen", getEnv("SOAK_DNS_LISTEN", ":53"), "DNS leak oracle listen address")
-	dnsDomainFlag := flag.String("dns-domain", getEnv("SOAK_DNS_DOMAIN", "sight.muterconn.com"), "Base domain for DNS leak oracle")
-	asnDBFlag := flag.String("asn-db", getEnv("SOAK_ASN_DB", ""), "Path to MaxMind .mmdb ASN database")
+	listenFlag := flag.String("listen", getEnv("MCSOAK_LISTEN", ":8443"), "HTTPS/H2 listen address")
+	quicFlag := flag.Bool("quic", getEnvBool("MCSOAK_QUIC", true), "Enable HTTP/3 QUIC listener")
+	quicListenFlag := flag.String("quic-listen", getEnv("MCSOAK_QUIC_LISTEN", ":9443"), "HTTP/3 QUIC UDP listen address")
+	tokenFlag := flag.String("token", getEnv("MCSOAK_TOKEN", ""), "Static bearer/query auth token")
+	certFlag := flag.String("cert", getEnv("MCSOAK_CERT", ""), "Path to TLS certificate file")
+	keyFlag := flag.String("key", getEnv("MCSOAK_KEY", ""), "Path to TLS private key file")
+	ifaceFlag := flag.String("iface", getEnv("MCSOAK_IFACE", "eth0"), "Network interface for reflector & tcpfp sniffer")
+	reflectorFlag := flag.Bool("reflector", getEnvBool("MCSOAK_REFLECTOR", false), "Enable eBPF pulse reflector")
+	tcpfpSniffFlag := flag.Bool("tcpfp-sniff", getEnvBool("MCSOAK_TCPFP_SNIFF", false), "Enable in-process AF_PACKET TCP SYN sniffer")
+	dnsleakFlag := flag.Bool("dnsleak", getEnvBool("MCSOAK_DNSLEAK", false), "Enable authoritative DNS leak oracle")
+	dnsListenFlag := flag.String("dns-listen", getEnv("MCSOAK_DNS_LISTEN", ":53"), "DNS leak oracle listen address")
+	dnsDomainFlag := flag.String("dns-domain", getEnv("MCSOAK_DNS_DOMAIN", "sight.muterconn.com"), "Base domain for DNS leak oracle")
+	asnDBFlag := flag.String("asn-db", getEnv("MCSOAK_ASN_DB", ""), "Path to MaxMind .mmdb ASN database")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -97,10 +115,7 @@ func main() {
 
 	var dnsSrv *dnsleak.Server
 	if *dnsleakFlag {
-		dnsSrv = dnsleak.NewServer(dnsStore, dnsleak.Config{
-			Addr:       *dnsListenFlag,
-			BaseDomain: *dnsDomainFlag,
-		})
+		dnsSrv = dnsleak.NewServer(dnsStore, buildDNSLeakConfig(*dnsListenFlag, *dnsDomainFlag))
 		if err := dnsSrv.Start(ctx); err != nil {
 			log.Printf("Warning: Failed to start DNS leak server on %s: %v", *dnsListenFlag, err)
 		} else {
