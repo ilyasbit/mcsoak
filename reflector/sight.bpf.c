@@ -80,9 +80,9 @@ static __always_inline __u16 csum_tcp_udp_helper(struct iphdr *iph, void *l4_hdr
     // Add TCP/UDP header and payload
     __u16 *ptr = l4_hdr;
     
-    // Bounded loop for eBPF verifier
+    // Bounded loop for eBPF verifier (max 256 bytes)
     #pragma clang loop unroll(full)
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 128; i++) {
         if ((void *)(ptr + 1) > data_end) {
             break;
         }
@@ -118,10 +118,10 @@ static __always_inline __u16 csum_ipv6_helper(struct ipv6hdr *ip6h, void *l4_hdr
     csum += bpf_htons(l4_len);
     csum += bpf_htons(proto);
     
-    // Add L4 header and payload
+    // Add L4 header and payload (max 256 bytes)
     __u16 *ptr = l4_hdr;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 128; i++) {
         if ((void *)(ptr + 1) > data_end) {
             break;
         }
@@ -145,6 +145,7 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *iph = (void *)(eth + 1);
         if ((void *)(iph + 1) > data_end) return XDP_PASS;
+        if (iph->ihl < 5) return XDP_PASS;
 
         if (iph->protocol == IPPROTO_UDP) {
             struct udphdr *udph = (void *)iph + (iph->ihl * 4);
@@ -183,6 +184,7 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                     if ((void *)(eth + 1) > data_end) return XDP_DROP;
                     iph = (void *)(eth + 1);
                     if ((void *)(iph + 1) > data_end) return XDP_DROP;
+                    if (iph->ihl < 5) return XDP_DROP;
                     udph = (void *)iph + (iph->ihl * 4);
                     if ((void *)(udph + 1) > data_end) return XDP_DROP;
 
@@ -241,7 +243,14 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                 __u32 client_ip = iph->saddr;
 
                 if (tcph->syn) {
+                    if ((bpf_ntohl(tcph->seq) & 0xFF) != 0x4D) {
+                        return XDP_DROP;
+                    }
+                    if ((void *)tcph + 256 < data_end) {
+                        return XDP_PASS;
+                    }
                     // TCP Handshake Spoofing (SYN -> SYN-ACK)
+                    emit_pulse_event_v4(client_ip, tcph->source, IPPROTO_TCP, 0x02);
                     // Swap MACs
                     __u8 tmp_mac[ETH_ALEN];
                     __builtin_memcpy(tmp_mac, eth->h_source, ETH_ALEN);
@@ -282,6 +291,16 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
 
                     return XDP_TX;
                 } else if (tcph->ack) {
+                    if (tcph->doff < 5) {
+                        return XDP_PASS;
+                    }
+                    void *tcp_end = (void *)tcph + (tcph->doff * 4);
+                    if (tcp_end != data_end) {
+                        return XDP_PASS;
+                    }
+                    if ((void *)tcph + 252 < data_end) {
+                        return XDP_PASS;
+                    }
                     // TCP Keepalive Reflector (ACK -> ACK + IP Payload)
                     if (bpf_xdp_adjust_tail(ctx, 4) != 0) {
                         return XDP_PASS;
@@ -294,8 +313,10 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                     if ((void *)(eth + 1) > data_end) return XDP_DROP;
                     iph = (void *)(eth + 1);
                     if ((void *)(iph + 1) > data_end) return XDP_DROP;
+                    if (iph->ihl < 5) return XDP_DROP;
                     tcph = (void *)iph + (iph->ihl * 4);
                     if ((void *)(tcph + 1) > data_end) return XDP_DROP;
+                    if (tcph->doff < 5) return XDP_DROP;
 
                     __u32 *payload = (void *)tcph + (tcph->doff * 4);
                     if ((void *)(payload + 1) > data_end) return XDP_DROP;
@@ -366,6 +387,10 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                 __u8 *payload = (void *)(udph + 1);
                 int has_magic = 0;
 
+                if ((void *)udph + 256 < data_end) {
+                    return XDP_PASS;
+                }
+
                 if ((void *)(payload + 4) <= data_end) {
                     if (payload[0] == 'M' && payload[1] == 'C' && payload[2] == 'P' &&
                         (payload[3] == 0 || payload[3] == 1)) {
@@ -379,6 +404,25 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                         __builtin_memcpy(payload + 16, &client_port_be, 2);
                     } else if ((void *)(payload + 16) <= data_end) {
                         __builtin_memcpy(payload, &client_ip, 16);
+                    } else if ((void *)(payload + 4) == data_end) {
+                        if (bpf_xdp_adjust_tail(ctx, 12) != 0) {
+                            return XDP_PASS;
+                        }
+
+                        data = (void *)(long)ctx->data;
+                        data_end = (void *)(long)ctx->data_end;
+                        eth = data;
+                        if ((void *)(eth + 1) > data_end) return XDP_DROP;
+                        ip6h = (void *)(eth + 1);
+                        if ((void *)(ip6h + 1) > data_end) return XDP_DROP;
+                        udph = (void *)(ip6h + 1);
+                        if ((void *)(udph + 1) > data_end) return XDP_DROP;
+
+                        payload = (void *)(udph + 1);
+                        if ((void *)(payload + 16) > data_end) return XDP_DROP;
+                        __builtin_memcpy(payload, &client_ip, 16);
+                    } else {
+                        return XDP_PASS;
                     }
                 } else {
                     // UDP Keepalive Reflector over IPv6 (Expand tail by 16 bytes)
@@ -443,6 +487,9 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                     if ((bpf_ntohl(tcph->seq) & 0xFF) != 0x4D) {
                         return XDP_DROP;
                     }
+                    if ((void *)tcph + 256 < data_end) {
+                        return XDP_PASS;
+                    }
                     // TCP Handshake Spoofing over IPv6 (SYN -> SYN-ACK)
                     emit_pulse_event_v6(&ip6h->saddr, tcph->source, IPPROTO_TCP, 0x02);
 
@@ -481,6 +528,16 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
 
                     return XDP_TX;
                 } else if (tcph->ack) {
+                    if (tcph->doff < 5) {
+                        return XDP_PASS;
+                    }
+                    void *tcp_end = (void *)tcph + (tcph->doff * 4);
+                    if (tcp_end != data_end) {
+                        return XDP_PASS;
+                    }
+                    if ((void *)tcph + 240 < data_end) {
+                        return XDP_PASS;
+                    }
                     // TCP Keepalive Reflector over IPv6 (ACK -> ACK + IP Payload)
                     if (bpf_xdp_adjust_tail(ctx, 16) != 0) {
                         return XDP_PASS;
@@ -495,6 +552,7 @@ int xdp_pulse_reflector(struct xdp_md *ctx) {
                     if ((void *)(ip6h + 1) > data_end) return XDP_DROP;
                     tcph = (void *)(ip6h + 1);
                     if ((void *)(tcph + 1) > data_end) return XDP_DROP;
+                    if (tcph->doff < 5) return XDP_DROP;
 
                     struct in6_addr *payload = (void *)tcph + (tcph->doff * 4);
                     if ((void *)(payload + 1) > data_end) return XDP_DROP;
@@ -558,6 +616,7 @@ int tc_egress_drop_rst(struct __sk_buff *skb) {
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *iph = (void *)(eth + 1);
         if ((void *)(iph + 1) > data_end) return TC_ACT_OK;
+        if (iph->ihl < 5) return TC_ACT_OK;
         if (iph->protocol != IPPROTO_TCP) return TC_ACT_OK;
 
         struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
@@ -569,7 +628,9 @@ int tc_egress_drop_rst(struct __sk_buff *skb) {
         if ((void *)(flags + 1) > data_end) return TC_ACT_OK;
 
         if (*flags & 0x04) {
+#ifdef MCSOAK_BPF_DEBUG
             bpf_printk("TC Egress: Vaporized IPv4 RST packet for port %d\n", TARGET_PORT);
+#endif
             return TC_ACT_SHOT; // Drop RST
         }
     } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
@@ -586,7 +647,9 @@ int tc_egress_drop_rst(struct __sk_buff *skb) {
         if ((void *)(flags + 1) > data_end) return TC_ACT_OK;
 
         if (*flags & 0x04) {
+#ifdef MCSOAK_BPF_DEBUG
             bpf_printk("TC Egress: Vaporized IPv6 RST packet for port %d\n", TARGET_PORT);
+#endif
             return TC_ACT_SHOT; // Drop RST
         }
     }
