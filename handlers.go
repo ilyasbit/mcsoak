@@ -204,6 +204,10 @@ func (s *Server) handleEcho(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleASN(w http.ResponseWriter, r *http.Request) {
+	if s.asnLookup == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "asn lookup not configured")
+		return
+	}
 	ipStr := extractClientIP(r)
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {

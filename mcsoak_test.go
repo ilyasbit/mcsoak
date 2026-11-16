@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -316,4 +318,66 @@ func TestConcurrentRequests_Race(t *testing.T) {
 		}(endpoint)
 	}
 	wg.Wait()
+}
+
+func TestHandleASNNilLookup(t *testing.T) {
+	srv, _, _, _ := newTestServer("")
+	req := httptest.NewRequest(http.MethodGet, "/asn?ip=1.1.1.1", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLoadOrGenerateTLS_IdempotentAndSANRegeneration(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "certs", "server.crt")
+	keyPath := filepath.Join(dir, "certs", "server.key")
+
+	if _, err := LoadOrGenerateTLS(certPath, ""); err == nil {
+		t.Fatal("expected error when only certPath is provided")
+	}
+	if _, err := LoadOrGenerateTLS("", keyPath); err == nil {
+		t.Fatal("expected error when only keyPath is provided")
+	}
+
+	cfg1, err := LoadOrGenerateTLS(certPath, keyPath, "example.test", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("first LoadOrGenerateTLS failed: %v", err)
+	}
+	leaf1, err := x509.ParseCertificate(cfg1.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf1: %v", err)
+	}
+
+	cfg2, err := LoadOrGenerateTLS(certPath, keyPath, "example.test", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("second LoadOrGenerateTLS failed: %v", err)
+	}
+	leaf2, err := x509.ParseCertificate(cfg2.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf2: %v", err)
+	}
+
+	if leaf1.SerialNumber.Cmp(leaf2.SerialNumber) != 0 {
+		t.Fatalf("expected idempotent reuse with same serial %s, got %s", leaf1.SerialNumber, leaf2.SerialNumber)
+	}
+
+	cfg3, err := LoadOrGenerateTLS(certPath, keyPath, "example.test", "10.0.0.1", "added.test")
+	if err != nil {
+		t.Fatalf("third LoadOrGenerateTLS failed: %v", err)
+	}
+	leaf3, err := x509.ParseCertificate(cfg3.Certificates[0].Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf3: %v", err)
+	}
+
+	if leaf1.SerialNumber.Cmp(leaf3.SerialNumber) == 0 {
+		t.Fatal("expected new certificate serial after SAN change")
+	}
+	if err := leaf3.VerifyHostname("added.test"); err != nil {
+		t.Fatalf("expected regenerated cert to cover added.test: %v", err)
+	}
 }
